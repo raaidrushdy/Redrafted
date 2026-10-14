@@ -146,7 +146,15 @@ export async function POST(request: Request) {
       client.messages
         .stream({
           model: "claude-sonnet-5",
-          max_tokens: 12000,
+          // Thinking tokens share this same budget on Sonnet 5, and 12000
+          // was below Anthropic's own ~64000 floor for streaming requests —
+          // on a large resume, thinking + the JSON wrapper + the full
+          // rewritten LaTeX document could exceed 12000 and get cut off
+          // mid-document, which is exactly the "incomplete LaTeX document"
+          // failure seen in production. Streaming means there's no HTTP
+          // timeout cost to raising this; maxDuration (120s) is still the
+          // real ceiling.
+          max_tokens: 32000,
           thinking: { type: "adaptive" },
           system: analysisSystemPrompt,
           messages: [{ role: "user", content: userContent }],
