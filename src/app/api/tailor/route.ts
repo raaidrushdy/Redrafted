@@ -197,6 +197,19 @@ export async function POST(request: Request) {
     // than trusting the schema alone.
     const tailoredResume = analysis.parsed_output.tailoredResume.trim();
     if (!tailoredResume.startsWith("\\documentclass") || !tailoredResume.endsWith("\\end{document}")) {
+      // Temporary diagnostic: the max_tokens-truncation theory didn't hold
+      // on its own (raising the cap to 32000 didn't stop this), so log
+      // enough to tell truncation (stop_reason "max_tokens", usage near the
+      // cap) apart from the model just not following the "no commentary,
+      // no fences" instruction (wrong prefix/suffix despite room left).
+      // Remove once the real cause is confirmed.
+      console.error("Incomplete LaTeX document diagnostics:", {
+        stopReason: analysis.stop_reason,
+        usage: analysis.usage,
+        resumeLength: tailoredResume.length,
+        startsWith: tailoredResume.slice(0, 80),
+        endsWith: tailoredResume.slice(-80),
+      });
       throw new Error("Model returned an incomplete LaTeX document");
     }
 
