@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useSyncExternalStore, type FormEvent } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore, type FormEvent } from "react";
 import { parseJsonResponse } from "@/lib/api";
 import { EXAMPLE_JOB_DESCRIPTION, EXAMPLE_RESUME } from "@/lib/example";
 import { Faq } from "@/components/Faq";
@@ -12,6 +12,7 @@ import { ResumeField } from "@/components/ResumeField";
 import { TailoringProgress } from "@/components/TailoringProgress";
 import { TrustPrivacy } from "@/components/TrustPrivacy";
 import { getRemaining, getServerRemaining, recordUse, subscribeToUsage } from "@/lib/usage";
+import { MAX_INPUT_CHARS } from "@/lib/limits";
 
 interface TailorResult {
   matchScore: number;
@@ -19,7 +20,6 @@ interface TailorResult {
   redFlags: string[];
   tailoredResume: string;
   coverLetter: string;
-  isLatex: boolean;
 }
 
 const GENERIC_ERROR = "The tailoring request failed. Try again in a moment.";
@@ -46,10 +46,15 @@ export default function Home() {
   const remaining = useSyncExternalStore(subscribeToUsage, getRemaining, getServerRemaining);
 
   const outOfFreeUses = remaining <= 0;
+  const overLength = resume.length > MAX_INPUT_CHARS || jobDescription.length > MAX_INPUT_CHARS;
   const canSubmit =
-    resume.trim().length > 0 && jobDescription.trim().length > 0 && !loading && !outOfFreeUses;
+    resume.trim().length > 0 &&
+    jobDescription.trim().length > 0 &&
+    !loading &&
+    !outOfFreeUses &&
+    !overLength;
 
-  async function runTailoring() {
+  const runTailoring = useCallback(async () => {
     if (!canSubmit) return;
 
     setLoading(true);
@@ -79,7 +84,7 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [canSubmit, resume, jobDescription]);
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -99,23 +104,50 @@ export default function Home() {
     setError(null);
   }
 
+  function resetToHome() {
+    startOver();
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" });
+  }
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        void runTailoring();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [runTailoring]);
+
   return (
     <>
-      <Header />
+      <Header onLogoClick={resetToHome} />
       <div className="flex-1">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-4 py-10 sm:gap-10 sm:px-6 sm:py-14 lg:max-w-4xl">
-          <div id="top" className="flex scroll-mt-24 flex-col items-center gap-3 pt-2 text-center">
-            <h1 className="max-w-xl text-4xl font-semibold tracking-tight sm:text-5xl">
-              Your resume, rewritten for every job.
-            </h1>
-            <p className="max-w-md text-muted sm:text-lg">
-              Paste your resume and the job posting. Get a tailored resume and cover letter back
-              in seconds.
-            </p>
-            <span className="rounded-full border border-accent/30 px-3 py-1 text-xs font-medium text-accent">
-              Free while we&apos;re testing
-            </span>
-          </div>
+          {!result && (
+            <div
+              id="top"
+              className="animate-reveal flex scroll-mt-24 flex-col items-center gap-4 pt-2 text-center"
+            >
+              <h1 className="max-w-2xl font-heading text-3xl font-semibold tracking-[-0.03em] sm:text-5xl lg:text-6xl">
+                Your resume, recompiled for the job.
+              </h1>
+              <p className="max-w-md text-base text-muted sm:text-lg">
+                Paste your .tex resume and the job posting. Get back a version that actually
+                matches, fast.
+              </p>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <span className="rounded-full border border-accent/30 px-3 py-1 text-xs font-medium text-accent">
+                  Free while testing
+                </span>
+                <span className="rounded-full border border-line px-3 py-1 font-mono text-xs text-muted">
+                  .tex only
+                </span>
+              </div>
+            </div>
+          )}
 
         <main className="contents">
         {loading && <TailoringProgress />}
@@ -127,7 +159,6 @@ export default function Home() {
             redFlags={result.redFlags}
             tailoredResume={result.tailoredResume}
             coverLetter={result.coverLetter}
-            isLatex={result.isLatex}
             originalResume={submittedResume}
             onStartOver={startOver}
           />
@@ -153,16 +184,22 @@ export default function Home() {
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-4 border-t border-line pt-6">
-              <button
-                type="submit"
-                disabled={!canSubmit}
-                className="inline-flex min-h-11 items-center gap-2 rounded-full bg-accent px-6 py-2.5 text-sm font-semibold text-accent-foreground transition disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <SparkleIcon />
-                Tailor my resume
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="submit"
+                  disabled={!canSubmit}
+                  className="inline-flex min-h-11 items-center gap-2 rounded-full bg-accent px-6 py-2.5 text-sm font-semibold text-accent-foreground outline-none transition-all duration-180 ease-precise hover:brightness-110 focus-visible:ring-2 focus-visible:ring-accent/50 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:brightness-100 disabled:active:scale-100"
+                >
+                  <SparkleIcon />
+                  Tailor my resume
+                </button>
+                <span className="hidden items-center gap-1 font-mono text-xs text-muted sm:inline-flex">
+                  <kbd className="rounded border border-line bg-surface px-1.5 py-0.5">⌘</kbd>
+                  <kbd className="rounded border border-line bg-surface px-1.5 py-0.5">Enter</kbd>
+                </span>
+              </div>
 
-              <span className="text-sm text-muted">
+              <span className={`text-sm text-muted ${outOfFreeUses ? "" : "font-mono tabular-nums"}`}>
                 {outOfFreeUses
                   ? "You've hit today's usage cap on this browser."
                   : `${remaining} free tailoring${remaining === 1 ? "" : "s"} left on this browser`}
@@ -172,7 +209,7 @@ export default function Home() {
             {outOfFreeUses && (
               <div
                 role="status"
-                className="rounded-xl border border-score-mid/40 bg-score-mid/10 p-4 text-sm text-score-mid"
+                className="rounded-xl border border-line bg-surface p-4 text-sm text-foreground"
               >
                 Message us if you want to keep testing. We&apos;ll bump it up.
               </div>
@@ -188,7 +225,7 @@ export default function Home() {
                   type="button"
                   onClick={() => void runTailoring()}
                   disabled={!canSubmit}
-                  className="inline-flex min-h-11 shrink-0 items-center rounded-lg border border-score-low/40 px-3 py-1.5 text-sm font-medium transition hover:bg-score-low/10 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="inline-flex min-h-11 shrink-0 items-center rounded-lg border border-score-low/40 px-3 py-1.5 text-sm font-medium outline-none transition-colors duration-180 ease-precise hover:bg-score-low/10 focus-visible:ring-2 focus-visible:ring-score-low/50 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100"
                 >
                   Retry
                 </button>

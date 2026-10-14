@@ -2,14 +2,19 @@ import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
-import { looksLikeLatex } from "@/lib/latex";
+import { MAX_INPUT_CHARS } from "@/lib/limits";
 
 export const runtime = "nodejs";
-// Adaptive thinking + a 16k output budget can comfortably exceed the platform's
-// default serverless timeout; this is the max duration Vercel's Hobby plan allows.
-export const maxDuration = 60;
-
-const MAX_INPUT_CHARS = 20000;
+// Vercel Hobby's default AND maximum is actually 300s with Fluid Compute
+// (enabled by default for any project created after April 2025, which this
+// one is) — the old assumption baked into this file, that Hobby hard-caps at
+// 60s, was outdated and this constant was the real bottleneck. 120s leaves
+// large headroom over every observed run (worst case ~27s pre-optimization,
+// well under that now) while stopping well short of the 300s ceiling, in
+// case Fluid Compute somehow isn't active for this project — verify in the
+// Vercel dashboard under Settings -> Functions -> Fluid Compute if timeouts
+// still occur after this change ships.
+export const maxDuration = 120;
 
 interface TailorRequestBody {
   resume?: string;
@@ -33,6 +38,9 @@ const TailorResultSchema = z.object({
       "Up to 3 short, specific issues a hiring manager would notice in the ORIGINAL resume within 10 seconds.",
     ),
   tailoredResume: z.string(),
+});
+
+const CoverLetterResultSchema = z.object({
   coverLetter: z.string(),
 });
 
@@ -70,71 +78,132 @@ export async function POST(request: Request) {
   }
 
   const client = new Anthropic({ apiKey });
-  const isLatex = looksLikeLatex(resume);
 
-  const rewriteInstruction = isLatex
-    ? "2. The original resume is LaTeX source. Edit it in place: reword bullet " +
-      "content, reorder items or sections where it helps the match, and work in " +
-      "the missing keywords wherever truthful — but preserve the document's " +
-      "existing structure, preamble, packages, and custom commands exactly. " +
-      "Where the original supports it, phrase bullets as 'accomplished X, as " +
-      "measured by Y, by doing Z' — but never invent a metric, employer, title, " +
-      "or date that isn't in the original; if there's no real number to cite, " +
-      "keep the bullet qualitative rather than fabricate one. tailoredResume must " +
-      "be the ENTIRE document from \\documentclass through \\end{document} with " +
-      "your edits applied — valid, compilable LaTeX, not a fragment, not rebuilt " +
-      "from scratch, no markdown code fences, no commentary outside the source.\n"
-    : "2. Rewrite the resume to close those gaps: naturally work in the missing " +
-      "keywords wherever truthful, and fix the red flags. Where the original resume " +
-      "supports it, phrase bullets as 'accomplished X, as measured by Y, by doing Z' " +
-      "— but never invent a metric, employer, title, or date that isn't in the " +
-      "original; if there's no real number to cite, keep the bullet qualitative " +
-      "rather than fabricate one. The original resume text may come from a PDF or " +
-      "Word doc, so it can contain stray formatting artifacts or layout whitespace " +
-      "— read through those to the actual content, and output the tailored resume " +
-      "as clean plain text.\n";
+  const rewriteInstruction =
+    "2. The original resume is LaTeX source. Edit it in place: reword bullet " +
+    "content, reorder items or sections where it helps the match, and work in " +
+    "the missing keywords wherever truthful — but preserve the document's " +
+    "existing structure, preamble, packages, and custom commands exactly. " +
+    "Where the original supports it, phrase bullets as 'accomplished X, as " +
+    "measured by Y, by doing Z' — but never invent a metric, employer, title, " +
+    "or date that isn't in the original; if there's no real number to cite, " +
+    "keep the bullet qualitative rather than fabricate one. tailoredResume must " +
+    "be the ENTIRE document from \\documentclass through \\end{document} with " +
+    "your edits applied — valid, compilable LaTeX, not a fragment, not rebuilt " +
+    "from scratch, no markdown code fences, no commentary outside the source.\n";
+
+  const userContent =
+    `Job description:\n"""\n${jobDescription}\n"""\n\n` + `Original resume:\n"""\n${resume}\n"""`;
 
   try {
-    const message = await client.messages.parse({
-      model: "claude-sonnet-5",
-      max_tokens: 16000,
-      thinking: { type: "adaptive" },
-      system:
-        "You are an expert resume writer and a senior technical recruiter for the " +
-        "exact company/role in the job description below. Work through this in order:\n\n" +
-        "1. As the recruiter, score how well the ORIGINAL resume matches the job " +
-        "description (0-100), list up to 5 important keywords/skills the posting " +
-        "emphasizes that the original resume doesn't mention, and up to 3 specific red " +
-        "flags a hiring manager would notice in the first 10 seconds (e.g. no measurable " +
-        "impact, buried relevant experience, jargon mismatch with the posting). Read " +
-        "through any markup (LaTeX commands, PDF/Word extraction artifacts) to the " +
-        "actual content for this analysis.\n" +
-        rewriteInstruction +
-        "3. Re-read your rewrite as an ATS filter and as a hiring manager skimming 200 " +
-        "resumes in one sitting — if any section would still get skipped, revise it.\n" +
-        "4. Write a concise, specific cover letter (under 350 words) for the same " +
-        "posting, as plain text.\n\n" +
-        "Report matchScore, missingKeywords, and redFlags for the ORIGINAL resume " +
-        "(step 1, before your rewrite) so the user can see what was wrong and what you " +
-        "fixed — not a re-score of your own output.",
-      messages: [
-        {
-          role: "user",
-          content:
-            `Job description:\n"""\n${jobDescription}\n"""\n\n` +
-            `Original resume:\n"""\n${resume}\n"""`,
-        },
-      ],
-      output_config: {
-        format: zodOutputFormat(TailorResultSchema),
-      },
-    });
+    // A non-streaming call sits fully buffered until generation finishes, so
+    // nothing comes back to Vercel until the last token is out — on a complex
+    // LaTeX resume that can trip a bare, non-JSON 504 before our own error
+    // handling below ever runs. Streaming (still awaited to one final
+    // response here, nothing is pushed to the client mid-generation)
+    // sidesteps that. maxDuration (see above) is still a hard cap on total
+    // wall time regardless of streaming, and the original single-call
+    // version generated the analysis, the full rewritten LaTeX, a
+    // self-critique pass, AND the cover letter serially in one completion —
+    // long enough on a large resume to blow through even the raised cap. The
+    // cover letter doesn't depend on the rewritten resume (same underlying
+    // facts, just different phrasing), so it's split into its own smaller,
+    // lower-effort call and run concurrently with the analysis+rewrite call:
+    // wall time is now roughly the slower of the two instead of their sum.
+    //
+    // Switched back to Sonnet 5: Opus at effort "low" was never
+    // latency-bound on model choice (effort was doing the limiting work, per
+    // the earlier measurement), so running Opus bought no speed — only
+    // ~2.5x the per-token cost — while trading away rewrite thoroughness for
+    // a cut that model choice alone didn't need.
+    //
+    // The analysis+rewrite call (the slower of the two — it also generates
+    // the full rewritten LaTeX document) runs at effort "medium" rather than
+    // "high": "high" measured ~90s end-to-end, and per Anthropic's own
+    // guidance "medium" is usually the cost/latency step-down that holds
+    // quality for coding/writing tasks like this one, unlike "low" which
+    // visibly cost thoroughness on Opus. Re-check output quality on a few
+    // real resumes after this change; bump back to "high" if it's not
+    // holding up. The cover letter call stays at "high" since it's small
+    // (max_tokens: 1500) and isn't the latency bottleneck.
+    const analysisSystemPrompt =
+      "You are an expert resume writer and a senior technical recruiter for the " +
+      "exact company/role in the job description below. Work through this in order:\n\n" +
+      "1. As the recruiter, score how well the ORIGINAL resume matches the job " +
+      "description (0-100), list up to 5 important keywords/skills the posting " +
+      "emphasizes that the original resume doesn't mention, and up to 3 specific red " +
+      "flags a hiring manager would notice in the first 10 seconds (e.g. no measurable " +
+      "impact, buried relevant experience, jargon mismatch with the posting). Read " +
+      "through the LaTeX markup to the actual content for this analysis.\n" +
+      rewriteInstruction +
+      "3. Re-read your rewrite as an ATS filter and as a hiring manager skimming 200 " +
+      "resumes in one sitting — if any section would still get skipped, revise it.\n\n" +
+      "Report matchScore, missingKeywords, and redFlags for the ORIGINAL resume " +
+      "(step 1, before your rewrite) so the user can see what was wrong and what you " +
+      "fixed — not a re-score of your own output.";
 
-    if (!message.parsed_output) {
+    const [analysis, coverLetter] = await Promise.all([
+      client.messages
+        .stream({
+          model: "claude-sonnet-5",
+          // Thinking tokens share this same budget on Sonnet 5, and 12000
+          // was below Anthropic's own ~64000 floor for streaming requests —
+          // on a large resume, thinking + the JSON wrapper + the full
+          // rewritten LaTeX document could exceed 12000 and get cut off
+          // mid-document, which is exactly the "incomplete LaTeX document"
+          // failure seen in production. Streaming means there's no HTTP
+          // timeout cost to raising this; maxDuration (120s) is still the
+          // real ceiling.
+          max_tokens: 32000,
+          thinking: { type: "adaptive" },
+          system: analysisSystemPrompt,
+          messages: [{ role: "user", content: userContent }],
+          output_config: {
+            format: zodOutputFormat(TailorResultSchema),
+            effort: "medium",
+          },
+        })
+        .finalMessage(),
+      client.messages
+        .stream({
+          model: "claude-sonnet-5",
+          max_tokens: 1500,
+          thinking: { type: "adaptive" },
+          system:
+            "You are an expert resume writer helping a candidate apply for the exact role " +
+            "in the job description below. Write a concise, specific cover letter (under " +
+            "350 words) for this candidate applying to this posting, as plain text. Base it " +
+            "only on the candidate's real resume content below (it's LaTeX source — read " +
+            "through the markup to the actual content) — never invent a metric, employer, " +
+            "title, or date that isn't in the original.",
+          messages: [{ role: "user", content: userContent }],
+          output_config: {
+            format: zodOutputFormat(CoverLetterResultSchema),
+            effort: "high",
+          },
+        })
+        .finalMessage(),
+    ]);
+
+    if (!analysis.parsed_output || !coverLetter.parsed_output) {
       throw new Error("Model response did not match the expected schema");
     }
 
-    return NextResponse.json({ ...message.parsed_output, isLatex });
+    // parsed_output existing only means the JSON matched the schema shape —
+    // a rare structured-output glitch can still land a near-empty string in
+    // a string field and pass that check. tailoredResume is the one field
+    // that must be a real, complete LaTeX document (the user pastes it
+    // straight into Overleaf or a compiler), so it gets its own check rather
+    // than trusting the schema alone.
+    const tailoredResume = analysis.parsed_output.tailoredResume.trim();
+    if (!tailoredResume.startsWith("\\documentclass") || !tailoredResume.endsWith("\\end{document}")) {
+      throw new Error("Model returned an incomplete LaTeX document");
+    }
+
+    return NextResponse.json({
+      ...analysis.parsed_output,
+      coverLetter: coverLetter.parsed_output.coverLetter,
+    });
   } catch (error) {
     console.error("Tailoring failed:", error);
     return NextResponse.json(
